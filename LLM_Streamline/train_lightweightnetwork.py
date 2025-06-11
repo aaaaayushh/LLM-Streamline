@@ -40,24 +40,43 @@ import torch
 
 class TensorDatasetFromDisk(Dataset):
     """
-    A custom PyTorch Dataset to load tensors saved to disk.
-
-    Args:
-        input_dir (str): Directory containing the input tensors.
-        output_dir (str): Directory containing the output tensors.
+    A custom PyTorch Dataset to load tensors saved to disk from multiple processes.
+    It expects filenames in the format 'p{process_id}_{local_sample_id}.pt'.
     """
 
     def __init__(self, input_dir, output_dir):
         self.input_dir = input_dir
         self.output_dir = output_dir
 
-        # Assuming filenames are sorted and correspond to each other
+        # --- Load and sort input files ---
+        input_files_on_disk = [
+            f for f in os.listdir(input_dir) if f.endswith(".pt")
+        ]
+        # Sort based on process ID, then local sample ID
         self.input_files = sorted(
-            os.listdir(input_dir), key=lambda x: int(x.split("_")[1].split(".")[0])
+            input_files_on_disk,
+            key=lambda x: (
+                int(x.split("_")[0][1:]),
+                int(x.split("_")[1].split(".")[0]),
+            ),
         )
+
+        # --- Load and sort output files ---
+        output_files_on_disk = [
+            f for f in os.listdir(output_dir) if f.endswith(".pt")
+        ]
         self.output_files = sorted(
-            os.listdir(output_dir), key=lambda x: int(x.split("_")[1].split(".")[0])
+            output_files_on_disk,
+            key=lambda x: (
+                int(x.split("_")[0][1:]),
+                int(x.split("_")[1].split(".")[0]),
+            ),
         )
+        
+        if not self.input_files:
+            raise FileNotFoundError(f"No '.pt' files found in directory: {input_dir}")
+        if not self.output_files:
+            raise FileNotFoundError(f"No '.pt' files found in directory: {output_dir}")
 
         assert len(self.input_files) == len(
             self.output_files

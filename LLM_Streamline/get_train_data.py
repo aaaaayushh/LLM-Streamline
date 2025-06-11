@@ -22,21 +22,37 @@ def precompute_and_save_data(
     Processes a dataset with a model and saves the specified hidden states
     to disk instead of holding them in memory.
     """
-    print(f"Preparing to save pre-computed data to '{save_dir}'...")
-    if os.path.exists(save_dir) and os.listdir(os.path.join(save_dir, "input")):
-        print(f"Data already exists in '{save_dir}'. Skipping pre-computation.")
+    accelerator = Accelerator()
+
+    input_save_dir = os.path.join(save_dir, "input")
+    output_save_dir = os.path.join(save_dir, "output")
+
+    if accelerator.is_main_process:
+        print(f"Preparing to save pre-computed data to '{save_dir}'...")
+        # Check if the target directory for inputs exists and is not empty.
+        if os.path.exists(input_save_dir) and os.listdir(input_save_dir):
+            print(f"Data already exists in '{save_dir}'. Skipping pre-computation.")
+            # Create a signal file for other processes to see.
+            with open(os.path.join(save_dir, ".skip_precompute"), "w") as f:
+                f.write("skip")
+        
+        # Ensure directories exist.
+        os.makedirs(input_save_dir, exist_ok=True)
+        os.makedirs(output_save_dir, exist_ok=True)
+
+    # All processes wait here until the main process has checked for data and created dirs.
+    accelerator.wait_for_everyone()
+
+    # If the signal file exists, all processes will skip pre-computation.
+    if os.path.exists(os.path.join(save_dir, ".skip_precompute")):
+        if accelerator.is_main_process:
+            # Clean up the signal file.
+            os.remove(os.path.join(save_dir, ".skip_precompute"))
         return
 
     # --- Setup ---
-    accelerator = Accelerator()
     model = accelerator.prepare(model)
     model.eval()
-
-    # --- Create directories for saved tensors ---
-    input_save_dir = os.path.join(save_dir, "input")
-    output_save_dir = os.path.join(save_dir, "output")
-    os.makedirs(input_save_dir, exist_ok=True)
-    os.makedirs(output_save_dir, exist_ok=True)
 
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
     dataloader = DataLoader(
@@ -47,9 +63,15 @@ def precompute_and_save_data(
     )
     dataloader = accelerator.prepare(dataloader)
 
-    print(f"Saving tensors to '{save_dir}'...")
+    if accelerator.is_main_process:
+        print(f"Saving tensors to '{save_dir}'...")
+    
     try:
-        for step, batch in tqdm(enumerate(dataloader), total=len(dataloader)):
+        for step, batch in tqdm(
+            enumerate(dataloader),
+            total=len(dataloader),
+            disable=not accelerator.is_main_process, # Only show progress bar on main process
+        ):
             with torch.no_grad():
                 hidden_states = model(
                     input_ids=batch["input_ids"],
@@ -60,22 +82,31 @@ def precompute_and_save_data(
             input_tensor = hidden_states[best_layer].cpu()
             output_tensor = hidden_states[best_layer + layer_intervals].cpu()
 
+            # Each process writes to files with a unique prefix (p0, p1, etc.)
             for i in range(input_tensor.size(0)):
-                sample_idx = step * batch_size + i
+                # This index is local to the process.
+                per_device_batch_size = input_tensor.size(0)
+                local_sample_idx = step * per_device_batch_size + i
+                process_idx = accelerator.process_index
+                filename = f"p{process_idx}_{local_sample_idx}.pt"
+
                 torch.save(
                     input_tensor[i],
-                    os.path.join(input_save_dir, f"sample_{sample_idx}.pt"),
+                    os.path.join(input_save_dir, filename),
                 )
                 torch.save(
                     output_tensor[i],
-                    os.path.join(output_save_dir, f"sample_{sample_idx}.pt"),
+                    os.path.join(output_save_dir, filename),
                 )
 
             del hidden_states, input_tensor, output_tensor
 
     finally:
+        # Final cleanup and synchronization.
         accelerator.free_memory()
         torch.cuda.empty_cache()
         gc.collect()
 
-    print("Finished saving data.")
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        print("Finished saving data.")
